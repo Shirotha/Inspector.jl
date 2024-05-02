@@ -1,0 +1,8 @@
+name = "Inspector"
+uuid = "f3582ec9-30c8-4d21-8b69-901bcee3a985"
+authors = ["Shirotha"]
+version = "0.1.0"
+
+[deps]
+Mousetrap = "5deeb4b9-6e04-4da7-8b7f-c77fb1eae65e"
+Observables = "510215fc-4207-5dde-b226-833fc4488ee2"
