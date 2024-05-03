@@ -1,24 +1,21 @@
-#=
-
-construct observable/regular struct pair using @NamedTuple like syntax
-observable struct should have support for validation, coersion and display attributes
-
-```julia
-@model MyModel begin
-    @coerce clamp(x, 1:100)
-    @drawer Slider
-    x::Int
-    @validate y < 0 && Err("y can't be negative")
-    y::Float64
+# ChangedEvent
+ChangedEventKey = Union{Symbol, Int}
+struct ChangedEvent{N}
+    path::NTuple{N, ChangedEventKey}
 end
-```
+ChangedEvent(path::Vararg{ChangedEventKey, N}) where N = ChangedEvent{N}(path)
 
-=#
-# Property
-abstract type AbstractProperty{T} end
-"Property representing a single (structured) value"
-struct ValueProperty{T, FConvert, FValidate, FCoerce} <: AbstractProperty{T}
-    name::Symbol
+Base.eltype(::Type{<:ChangedEvent}) = Symbol
+Base.length(::ChangedEvent{N}) where N = N
+Base.iterate(::ChangedEvent{N}, state=1) where N = state >= N ? nothing : (e.path[state], state+1)
+Base.isdone(::ChangedEvent{N}, state=1) where N = state >= N
+# end ChangedEvent
+
+abstract type AbstractProperty end
+
+# ValueProperty
+"Property representing a single (terminal) value"
+struct ValueProperty{T, FConvert, FValidate, FCoerce} <: AbstractProperty
     value::Observable{T}
     drawer::Symbol # TODO: how to store drawer data properly
 
@@ -29,86 +26,148 @@ struct ValueProperty{T, FConvert, FValidate, FCoerce} <: AbstractProperty{T}
     "modify incoming value before updating value. T -> T"
     coerce::FCoerce
 end
-function ValueProperty(name::Symbol, value::T;
+function ValueProperty(value::T;
     drawer::Symbol = :default,
     convert::FConvert = v -> convert(T, v),
-    validate::FValidate = _ -> true,
+    validate::FValidate = Ok,
     coerce::FCoerce = identity
 ) where {T, FConvert, FValidate, FCoerce}
     value = Observable(value; ignore_equal_values = true)
-    ValueProperty{T, FConvert, FValidate, FCoerce}(name, value, drawer, convert, validate, coerce)
+    ValueProperty{T, FConvert, FValidate, FCoerce}(value, drawer, convert, validate, coerce)
 end
 
 observable(p::ValueProperty) = p.value
+value(p::ValueProperty) = p.value[]
 
 Base.getindex(p::ValueProperty) = p.value[]
 Base.setindex!(p::ValueProperty, value) = map(v -> p.value[] = p.coerce(v), value |> p.convert |> p.validate)
-
-"Property representing a collection of values"
-struct CollectionProperty{T} <: AbstractProperty{T}
-    name::Symbol
-    items::T
-end
-
-# TODO: implement this
-observable(p::CollectionProperty) = throw("not implemented")
-
-Base.getindex(p::CollectionProperty, i) = p.items[i]
-# TODO: implement this
-Base.setindex!(p::CollectionProperty, value, i) = throw("not implemented")
-
 # end Property
 
-# Model
-export Model
-getobservabletype(::Type{T}) where T = throw("no observable model implemented for type $(T)")
-observables(m) = observable.(getproperty.(m, propertynames(m)))
+# StructProperty
+"Property representing heterogeneous data with named fields"
+mutable struct StructProperty{Names, T} <: AbstractProperty
+    data::NamedTuple{Names, T}
+    event::Observable{ChangedEvent}
+    drawer::Symbol # TODO: how to store drawer data properly
+
+    listeners::Vector{ObserverFunction}
+end
+function StructProperty(data::NamedTuple{Names, T}; drawer=:default) where {Names, T}
+    event = Observable{ChangedEvent}(ChangedEvent())
+    function register(name, obs)
+        on(obs; weak = true) do value
+            event[] = if value isa ChangedEvent
+                ChangedEvent(name, value...)
+            else
+                ChangedEvent(name)
+            end
+        end
+    end
+    listeners = register.(Names, [observable.(values(data))...])
+    StructProperty{Names, T}(data, event, drawer, listeners)
+end
+StructProperty(; data...) = StructProperty((; data...))
+
+observable(p::StructProperty) = p.event
+value(p::StructProperty{Names}) where Names = NamedTuple{Names}(value.(p.data |> values))
+
+Base.getindex(p::StructProperty, name::Symbol) = p.data[name]
+# end SructProperty
+
+# ArrayProperty
+"Property representing homogeneous data with index access"
+struct ArrayProperty{T, N} <: AbstractProperty
+    data::Array{T, N}
+    event::Observable{ChangedEvent}
+    drawer::Symbol
+
+    listeners::Array{ObserverFunction, N}
+end
+function ArrayProperty(data::Array{T, N}; drawer=:default) where {T, N}
+    event = Observable{ChangedEvent}(ChangedEvent())
+    listeners = map(enumerate(data)) do (idx, dat)
+        on(dat |> observable; weak = true) do value
+            event[] = if value isa ChangedEvent
+                ChangedEvent(idx, value)
+            else
+                ChangedEvent(idx)
+            end
+        end
+    end
+    ArrayProperty{T, N}(data, event, drawer, listeners)
+end
+
+observable(p::ArrayProperty) = p.event
+value(p::ArrayProperty) = value.(p.data)
+
+Base.getindex(p::ArrayProperty, idx...) = p.data[idx...]
+
+# TODO: implment adding/removing elements
+# end ArrayProperty
+
+"Create a new `AbstractProperty` object from any data"
+Property(data; kwargs...) = ValueProperty(data; kwargs...)
+Property(p::AbstractProperty; kwargs...) = p
 
 """
-Hold property information and handles conversion to and from plain data.
-Redirectes property access to internal data.
+This macro will declare a data type to be used with `Property`.
 
-# Generic Arguments
-- `TObservable`: Type that holds all [AbstractProperty](@ref)
-    (needs a constructor `TObservable(TPlain)`)
-- `TPlain`: Type of the pure data without property information
-    (needs a constructor from all properties ordered as returned by `propertynames`)
-
-Both types have to share the same `propertynames`.
+# Examples
+```julia
+@model struct MyModel <: MyAbstractModel
+    @validate length(name) <= 100
+    name::String
+    @coerce clamp(count, 1:100)
+    @drawer Slider(1, 100)
+    count::Int
+    data::SubModel
+end
+```
 """
-struct Model{TObservable, TPlain}
-    properties::TObservable
-    observable::Observable{TPlain}
-end
-function Model{TObservable}(data::TPlain) where {TObservable, TPlain}
-    m = TObservable(data)
-    obs = map((ps...) -> TPlain(ps...), observables(m))
-    Model{TObservable, TPlain}(m, obs)
-end
-Model(data::TPlain) where TPlain = Model{getobservabletype(TPlain)}(data)
-
-observable(m::Model) = getfield(m, :observable)
-
-Base.propertynames(m::Model, private=false) = propertynames(m.properties)
-Base.getproperty(m::Model, name::Symbol) = getproperty(m.properties, name)
-Base.setproperty!(m::Model, name::Symbol, value) = setproperty!(m.properties, name, value)
-# end Model
-
-#=
-@model $typename({$typeargs...} (where {$constraints...})) begin
-    $inner...
-end
-attribute:
-    head: macrocall
-    args[1]: name
-    args[2]: body
-
-    allowed names: validate, coerce, drawer (+ compound macros?)
-property:
-    head: ::
-    args[1]: name
-    args[2]: type
-=#
 macro model(expr)
-    # TODO: implement this
+    function fielddec((name, T, _))
+        @esc name T
+        :($name::$T)
+    end
+    function kwarg((name, value))
+        @esc name value
+        :($name = $value)
+    end
+    function propertycall((name, _, attrs))
+        @esc name
+        :($name = Property(getfield(data, $name); $(kwarg.(attrs))))
+    end
+
+    @capture(expr, struct head_ lines__ end) || throw("expected struct definition")
+    T = head |> namify |> esc
+    fields = []
+    attrs = []
+    for line in lines
+        if @capture(line, name_ :: T_)
+            map!(attrs, attrs) do (attr, value)
+                if attr in (:validate, :coerce)
+                    (attr, :($(name |> esc) -> $(value |> esc)))
+                else
+                    (attr, value)
+                end
+            end
+            push!(fields, (name, T, attrs))
+            attrs = []
+        elseif line.head === :macrocall
+            push!(attrs, (args[1], args[2]))
+        else
+            throw("expected field or macrocall")
+        end
+    end
+
+    @esc head T
+    quote
+        struct $head
+            $(fielddec.(fields)...)
+        end
+        function Property(data::$T; drawer=:default)
+            data = (; $(propertycall.(fields)))
+            StructProperty(data; drawer)
+        end
+    end
 end

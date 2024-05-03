@@ -1,7 +1,7 @@
 module Inspector
 
 using Mousetrap
-using Observables
+using Observables, MacroTools
 
 # Result monad
 struct Ok{T}
