@@ -1,46 +1,51 @@
 # ChangedEvent
 ChangedEventKey = Union{Symbol, Int}
-struct ChangedEvent{N}
+"Represents a change in a `ValueProperty`"
+struct ChangedEvent{T, N}
+    "`Observable` that was changed"
+    source::Option{Observable{T}}
+    "property/index path from listener to source"
     path::NTuple{N, ChangedEventKey}
 end
-ChangedEvent(path::Vararg{ChangedEventKey, N}) where N = ChangedEvent{N}(path)
+ChangedEvent(source::Observable{T}, path::Vararg{ChangedEventKey, N}) where {T, N} = ChangedEvent{T, N}(source |> Some, path)
+ChangedEvent{T}(path::Vararg{ChangedEventKey, N}) where {T, N} = ChangedEvent{T, N}(nothing, path)
+ChangedEvent(prefix::ChangedEventKey, e::ChangedEvent) = ChangedEvent(e.source, prefix, e.path...)
 
-Base.eltype(::Type{<:ChangedEvent}) = Symbol
-Base.length(::ChangedEvent{N}) where N = N
-Base.iterate(::ChangedEvent{N}, state=1) where N = state >= N ? nothing : (e.path[state], state+1)
-Base.isdone(::ChangedEvent{N}, state=1) where N = state >= N
+Base.getindex(e::ChangedEvent) = map(getindex, e.source) |> something
+path(e::ChangedEvent) = e.path
 # end ChangedEvent
 
 abstract type AbstractProperty end
 
 # ValueProperty
 "Property representing a single (terminal) value"
-struct ValueProperty{T, FConvert, FValidate, FCoerce} <: AbstractProperty
+struct ValueProperty{T, TDrawer, FConvert, FValidate} <: AbstractProperty
     value::Observable{T}
-    drawer::Symbol # TODO: how to store drawer data properly
+    "ViewModel of the drawer. Should redraw GUI when changed"
+    drawer::Observable{TDrawer}
 
     "convert from user values. U -> T where U"
     convert::FConvert
-    "reject invalid values. T -> Result{T, E} where E"
+    "reject invalid values and/or coerce into valid range. (T, TDrawer) -> Result{T, E} where E"
     validate::FValidate
-    "modify incoming value before updating value. T -> T"
-    coerce::FCoerce
+
+    listener::ObserverFunction
 end
-function ValueProperty(value::T;
-    drawer::Symbol = :default,
+function ValueProperty(value::Observable{T};
+    drawer::Observable{TDrawer} = Observable(missing),
     convert::FConvert = v -> convert(T, v),
-    validate::FValidate = Ok,
-    coerce::FCoerce = identity
-) where {T, FConvert, FValidate, FCoerce}
-    value = Observable(value; ignore_equal_values = true)
-    ValueProperty{T, FConvert, FValidate, FCoerce}(value, drawer, convert, validate, coerce)
+    validate::FValidate = (v, _) -> Ok(v),
+) where {T, TDrawer, FConvert, FValidate}
+    listener = on(d -> value[] = validate(value[], d), drawer; weak = true)
+    ValueProperty{T, TDrawer, FConvert, FValidate}(value, drawer, convert, validate, listener)
 end
 
 observable(p::ValueProperty) = p.value
 value(p::ValueProperty) = p.value[]
+drawer(p::ValueProperty) = p.drawer
 
 Base.getindex(p::ValueProperty) = p.value[]
-Base.setindex!(p::ValueProperty, value) = map(v -> p.value[] = p.coerce(v), value |> p.convert |> p.validate)
+Base.setindex!(p::ValueProperty, value) = map(v -> p.value[] = v, p.validate(value |> p.convert, p.drawer[]))
 # end Property
 
 # StructProperty
@@ -53,13 +58,13 @@ mutable struct StructProperty{Names, T} <: AbstractProperty
     listeners::Vector{ObserverFunction}
 end
 function StructProperty(data::NamedTuple{Names, T}; drawer=:default) where {Names, T}
-    event = Observable{ChangedEvent}(ChangedEvent())
+    event = Observable{ChangedEvent}(ChangedEvent{Missing}())
     function register(name, obs)
         on(obs; weak = true) do value
             event[] = if value isa ChangedEvent
-                ChangedEvent(name, value...)
+                ChangedEvent(name, value)
             else
-                ChangedEvent(name)
+                ChangedEvent(obs, name)
             end
         end
     end
@@ -84,13 +89,14 @@ struct ArrayProperty{T, N} <: AbstractProperty
     listeners::Array{ObserverFunction, N}
 end
 function ArrayProperty(data::Array{T, N}; drawer=:default) where {T, N}
-    event = Observable{ChangedEvent}(ChangedEvent())
+    event = Observable{ChangedEvent}(ChangedEvent{Missing}())
     listeners = map(enumerate(data)) do (idx, dat)
-        on(dat |> observable; weak = true) do value
+        obs = dat |> observable
+        on(obs; weak = true) do value
             event[] = if value isa ChangedEvent
                 ChangedEvent(idx, value)
             else
-                ChangedEvent(idx)
+                ChangedEvent(obs, idx)
             end
         end
     end
@@ -109,65 +115,68 @@ Base.getindex(p::ArrayProperty, idx...) = p.data[idx...]
 Property(data; kwargs...) = ValueProperty(data; kwargs...)
 Property(p::AbstractProperty; kwargs...) = p
 
+# TODO: create all obervables first, then make them available in validate/drawer context
 """
 This macro will declare a data type to be used with `Property`.
 
 # Examples
 ```julia
 @model struct MyModel <: MyAbstractModel
-    @validate length(name) <= 100
-    name::String
-    @coerce clamp(count, 1:100)
-    @drawer Slider(1, 100)
-    count::Int
+    @validate min > max ? Ok(max) : Ok(min)
+    min::Int
+    @validate max < min ? Ok(min) : Ok(max)
+    max::Int
+    @drawer Slider(min, max)
+    @validate clamp(value, min, max) |> Ok
+    value::Int
+    @validate myvalidator(data) ? Ok(data) : Err("data not valid")
     data::SubModel
 end
 ```
 """
 macro model(expr)
-    function fielddec((name, T, _))
-        @esc name T
-        :($name::$T)
+    struct FieldData
+        name::Expr
+        type::Expr
+        validate::Option{Expr}
+        drawer::Option{Expr}
     end
-    function kwarg((name, value))
-        @esc name value
-        :($name = $value)
-    end
-    function propertycall((name, _, attrs))
-        @esc name
-        :($name = Property(getfield(data, $name); $(kwarg.(attrs))))
+    function declare_field(f::FieldData)
+        :($(f.name) :: $(f.type))
     end
 
     @capture(expr, struct head_ lines__ end) || throw("expected struct definition")
     T = head |> namify |> esc
     fields = []
-    attrs = []
+    validate = nothing
+    drawer = nothing
     for line in lines
-        if @capture(line, name_ :: T_)
-            map!(attrs, attrs) do (attr, value)
-                if attr in (:validate, :coerce)
-                    (attr, :($(name |> esc) -> $(value |> esc)))
-                else
-                    (attr, value)
-                end
+        if line.head == :macrocall
+            attr, body = line.args
+            if attr == :validate
+                validate = body |> esc
+            elseif attr == :drawer
+                drawer = body |> esc
+            else
+                throw("unrecognized attribute: expected validate or drawer, given $(attr)")
             end
-            push!(fields, (name, T, attrs))
-            attrs = []
-        elseif line.head === :macrocall
-            push!(attrs, (args[1], args[2]))
+        elseif @capture(line, field_ :: type_)
+            @esc field type
+            push!(fields, FieldData(field, type, validate, drawer))
+            validate = drawer = nothing
         else
-            throw("expected field or macrocall")
+            throw("unexpected expression: expected macrocall or field declaration, given $(line)")
         end
     end
-
-    @esc head T
+    # TODO: in validate/drawer, substitute otherfield -> otherfield[] (only when otherfield is a valid field)
     quote
         struct $head
-            $(fielddec.(fields)...)
+            $(declare_field.(fields)...)
         end
-        function Property(data::$T; drawer=:default)
-            data = (; $(propertycall.(fields)))
-            StructProperty(data; drawer)
+        function Property(data::$T; kwargs...)
+            # TODO: initialize all field proeprties (how to do this before callbacks are created?)
+            # TODO: store observable from all fields in variable with name of field
+            # TODO: create validate/drawer callbacks while capturing field observables
         end
     end
 end
