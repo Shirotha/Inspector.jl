@@ -1,7 +1,8 @@
 module Inspector
 
-using Mousetrap
-using Observables, MacroTools
+using Mousetrap, Observables
+using MacroTools
+import MacroTools: postwalk
 
 # Option monad
 Option{T} = Union{Some{T}, Nothing}
@@ -26,6 +27,10 @@ isok(r::Ok) = true
 isok(r::Err) = false
 Base.map(f, r::Ok) = r |> ok |> f |> Ok
 Base.map(f, r::Err) = r
+unwrap(f, g, r::Ok) = f(r.value)
+unwrap(f, g, r::Err) = g(r.error)
+maperr(f, r::Ok) = r
+maperr(f, r::Err) = r.error |> f |> Err
 # end Result
 
 include("Model.jl")
