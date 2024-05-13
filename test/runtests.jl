@@ -2,7 +2,7 @@ using Inspector, Test
 
 @testset "Model" begin
     using Observables
-    import Inspector: Ok, Err, ValueProperty, StructProperty, ArrayProperty, path, ValidationError, error, ObservablePipe
+    import Inspector: Ok, Err, ValueProperty, StructProperty, ArrayProperty, path, ValidationError, lasterror, ObservablePipe
     @testset "ValueProperty" begin
         import Inspector: Ok, Err, ValueProperty
         validate(v) = v < 0 ? Err("can't be negative") : clamp(v, 1:100) |> Ok
@@ -14,7 +14,7 @@ using Inspector, Test
         @test p[] == 100
         p[] = -1
         @test p[] == 100
-        @test error(p)[] == ValidationError(-1, "can't be negative")
+        @test lasterror(p)[] == ValidationError(-1, "can't be negative")
     end
     @testset "StructProperty" begin
         p1 = ValueProperty(1)

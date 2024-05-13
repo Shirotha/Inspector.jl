@@ -10,6 +10,8 @@ Option{T} = Union{Some{T}, Nothing}
 issomething(x) = !isnothing(x)
 Base.map(f, o::Some) = o |> something |> f |> Some
 Base.map(f, ::Nothing) = nothing
+unwrap(f, g, o::Some) = o |> something |> f
+unwrap(f, g, ::Nothing) = g()
 # end Option
 
 # Result monad

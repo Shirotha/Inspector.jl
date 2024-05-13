@@ -112,7 +112,7 @@ end
 observable(p::ValueProperty) = p.value.output
 value(p::ValueProperty) = p.value[]
 drawer(p::ValueProperty) = p.drawer
-error(p::ValueProperty) = p.value.error
+lasterror(p::ValueProperty) = p.value.error
 
 Base.getindex(p::ValueProperty) = p.value[]
 Base.setindex!(p::ValueProperty, value) = p.value[] = value
@@ -120,17 +120,20 @@ Base.setindex!(p::ValueProperty, value) = p.value[] = value
 
 # StructProperty
 "Property representing heterogeneous data with named fields"
-struct StructProperty{Names, T, TDrawer} <: AbstractProperty
+struct StructProperty{Names, T, TDrawer, TDeref} <: AbstractProperty
     data::NamedTuple{Names, T}
     event::Observable{ChangedEvent}
     drawer::Observable{TDrawer}
+
+    deref::TDeref
 
     listeners::Vector{ObserverFunction}
 end
 function StructProperty(
     data::NamedTuple{Names, T};
-    drawer::Observable{TDrawer} = Observable(missing)
-) where {Names, T, TDrawer}
+    drawer::Observable{TDrawer} = Observable(missing),
+    deref::TDeref = identity
+) where {Names, T, TDrawer, TDeref}
     event = Observable{ChangedEvent}(ChangedEvent{Missing}())
     function register(name, obs)
         on(obs; weak = true) do value
@@ -142,7 +145,7 @@ function StructProperty(
         end
     end
     listeners = register.(Names, [observable.(values(data))...])
-    StructProperty{Names, T, TDrawer}(data, event, drawer, listeners)
+    StructProperty{Names, T, TDrawer, TDeref}(data, event, drawer, deref, listeners)
 end
 StructProperty(; data...) = StructProperty((; data...))
 
@@ -150,6 +153,7 @@ observable(p::StructProperty) = p.event
 value(p::StructProperty{Names}) where Names = NamedTuple{Names}(value.(p.data |> values))
 
 Base.getindex(p::StructProperty, name::Symbol) = p.data[name]
+Base.getindex(p::StructProperty) = p.deref(p.data)
 # end SructProperty
 
 # ArrayProperty
@@ -190,20 +194,22 @@ Base.getindex(p::ArrayProperty, idx...) = p.data[idx...]
 "This should return a subtype of `AbstractProperty` that should be used to represent data of type `T`"
 PropertyType(T::Type) = ValueProperty
 
-struct FieldInfo
+export inspect
+inspect(data) = error("no model registered with data of type $(data |> typeof)")
+
+struct FieldInfo{T}
     name::Symbol
-    type::Expr
-    convert::Option{Expr}
-    validate::Option{Expr}
-    drawer::Option{Expr}
+    type::Union{Symbol, Expr}
+    convert::Option{T}
+    validate::Option{T}
+    drawer::Option{T}
 end
-function FieldInfo(name::Symbol, type::Expr=Any;
-    convert::Option{Expr} = nothing,
-    validate::Option{Expr} = nothing,
-    drawer::Option{Expr} = nothing
-)
-    FieldInfo(name, type, convert, validate, drawer)
+struct FunctionInfo
+    body::Expr
+    deps::Set{Symbol}
 end
+
+export @model
 """
 This macro will declare a data type to be used with `Property`.
 
@@ -226,37 +232,124 @@ macro model(expr)
     function parse_callback(this::Symbol, body, fields)
         deps = Set{Symbol}()
         body = postwalk(body) do expr
-            if !(expr isa Symbol) || (expr in fields && expr != this)
+            if !(expr isa Symbol) || expr == this || !(expr in fields)
                 return expr
             end
             push!(deps, expr)
             :($expr[])
         end
-        (:($this -> $body), deps)
+        (body, deps)
+    end
+    function parse_state(body, fields)
+        args = Set{Symbol}()
+        body = postwalk(body) do expr
+            if expr isa Symbol && expr in fields
+                push!(args, expr)
+            end
+            expr
+        end
+        (body, args)
+    end
+
+    function esc_fielddec(field)
+        :($(field.name |> esc)::$(field.type |> esc))
+    end
+    function esc_initobs(field)
+        :(if PropertyType($(field.type)) == ValueProperty
+            $(field.name |> esc) = Observable(getfield(data, $(field.name |> QuoteNode)); ignore_equal_values = true)
+            $(Symbol("raw_", field.name) |> esc) = Observable(getfield(data, $(field.name |> QuoteNode)); ignore_equal_values = true)
+        else
+            # FIXME: circular dependency: {field} needs drawer_{field}, and drawer_{field} needs {field}
+            $(field.name |> esc) = inspect(getfield(data, $(field.name |> QuoteNode)); drawer = $(Symbol("drawer_", field.name)))
+        end)
+    end
+    function esc_defconvert(field)
+        body = unwrap(
+            c -> c.body |> esc,
+            () -> :(convert($(field.type |> esc), $(field.name |> esc))),
+            field.convert
+        )
+        :($(Symbol("convert_", field.name) |> esc)(
+            $(field.name |> esc)
+        ) = $body)
+    end
+    function esc_defvalidate(field)
+        body = unwrap(
+            v -> v.body |> esc,
+            () -> :(Ok($(field.name |> esc))),
+            field.validate
+        )
+        :($(Symbol("validate_", field.name) |> esc)(
+            $(field.name |> esc)
+        ) = $body)
+    end
+    function esc_notify(name)
+        :(notify($(Symbol("raw_", name) |> esc)))
+    end
+    function esc_registerdeps(name, deps)
+        if isempty(deps[name])
+            return missing
+        end
+        :(on($(name |> esc); weak = true) do _
+            $(esc_notify.(deps[name])...)
+        end)
+    end
+    function esc_drawerdeps(field; deref=false)
+        unwrap(() -> (), field.drawer) do drawer
+            map(drawer.deps) do name
+                deref ? :($(name |> esc)[]) : esc(name)
+            end
+        end
+    end
+    function esc_drawerarg(field)
+        unwrap(identity, () -> :(missing), field.drawer)
+    end
+    function esc_initdrawer(field)
+        quote
+            $(Symbol("drawer_", field.name, "_update"))($(esc_drawerdeps(field)...)) = $(esc_drawerarg(field))
+            $(Symbol("drawer_", field.name) |> esc) = Observable($(Symbol("drawer_", field.name, "_update"))($(esc_drawerdeps(field; deref = true)...)); ignore_equal_values = true)
+            # TODO: register onany callback if drawerdeps is not empty
+        end
+    end
+    function esc_localfield(field)
+        :(getfield(this, $(field.name |> QuoteNode))[])
+    end
+    function esc_initderef(type, fields)
+        :(deref(this) = $(type |> esc)(
+            $(esc_localfield.(fields)...)
+        ))
+    end
+    function esc_initfield(field)
+        :($(field.name |> esc) = $(field.name |> esc) isa AbstractProperty ? $(field.name |> esc)
+            : ValueProperty(
+                $(Symbol("raw_", field.name) |> esc),
+                $(field.name |> esc),
+                convert = $(Symbol("convert_", field.name) |> esc),
+                validate = $(Symbol("validate_", field.name) |> esc),
+                drawer = $(Symbol("drawer_", field.name) |> esc)
+            ))
     end
 
     @capture(expr, struct head_ lines__ end) || error("expected struct definition")
-    T = head |> namify |> esc
 
-    fields = Vector{FieldInfo}
+    fields = FieldInfo{Expr}[]
     convert::Option{Expr} = nothing
     validate::Option{Expr} = nothing
     drawer::Option{Expr} = nothing
     for line in lines
         if @capture(line, name_ :: type_)
-            if name in keys(fields)
-                error("field $(name) already exists")
-            end
-            push!(fields, FieldInfo(name, type; convert, validate, drawer))
+            push!(fields, FieldInfo{Expr}(name, type, convert, validate, drawer))
             convert = validate = drawer = nothing
         elseif line.head == :macrocall
-            name, body = line.args
-            if name == :convert
-                convert = body
-            elseif name == :validate
-                validate = body
-            elseif name == :drawer
-                drawer = body
+            name, node, body = line.args
+            # TODO: preserve line numbers for debugging
+            @assert node isa LineNumberNode
+            if name == Symbol("@convert")
+                convert = Some(body)
+            elseif name == Symbol("@validate")
+                validate = Some(body)
+            elseif name == Symbol("@drawer")
+                drawer = Some(body)
             else
                 error("unknown attribute $(name)")
             end
@@ -264,13 +357,55 @@ macro model(expr)
             error("unrecognized expression")
         end
     end
+
     names = getfield.(fields, :name)
+    fields = map(fields) do field
+        c = map(field.convert) do c
+            FunctionInfo(parse_callback(field.name, c, names)...)
+        end
+        v = map(field.validate) do v
+            FunctionInfo(parse_callback(field.name, v, names)...)
+        end
+        d = map(field.drawer) do d
+            FunctionInfo(parse_state(d, names)...)
+        end
+        FieldInfo{FunctionInfo}(field.name, field.type, c, v, d)
+    end
+    notifydeps = Dict{Symbol, Set{Symbol}}()
+    for name in names
+        notify = Set{Symbol}()
+        for field in fields
+            if field.name == name continue end
+            map(field.convert) do c
+                if name in c.deps
+                    push!(notify, field.name)
+                end
+            end
+            map(field.validate) do v
+                if name in v.deps
+                    push!(notify, field.name)
+                end
+            end
+        end
+        notifydeps[name] = notify
+    end
 
-    # TODO: build type for plain data named T
-    # TODO: implement inspect overload for type T
-        # TODO: create new observables for fields with PropertyType == ValueProperty and grab existing observables from other fields
-        # TODO: define convert/validate callbacks for ValueProperty fields
-        # TODO: register listeners to notify dependencies of fields
-        # TODO: construct StructProperty from all fields
-
+    quote
+        struct $(head |> esc)
+            $(esc_fielddec.(fields)...)
+        end
+        Inspector.PropertyType(::Type{$(head |> namify |> esc)}) = StructProperty
+        # TODO: handle cases with generic head (might refer to type parameters inside callbacks)
+        function Inspector.inspect(data::$(head |> namify |> esc); drawer = Observable(missing))
+            $(esc_initobs.(fields)...)
+            $(esc_defconvert.(fields)...)
+            $(esc_defvalidate.(fields)...)
+            listeners = [$(skipmissing(esc_registerdeps.(names, (notifydeps,)))...)]
+            $(esc_initdrawer.(fields)...)
+            $(esc_initderef(head |> namify, fields))
+            result = StructProperty((;$(esc_initfield.(fields)...)); drawer, deref)
+            append!(result.listeners, listeners)
+            result
+        end
+    end
 end
