@@ -36,5 +36,6 @@ maperr(f, r::Err) = r.error |> f |> Err
 # end Result
 
 include("Model.jl")
+include("Drawer.jl")
 
 end # module Inspector

@@ -20,19 +20,23 @@ struct ObservablePipe{S, T, E} <: AbstractObservable{T}
     input::Observable{S}
     output::Observable{T}
     error::Observable{E}
+    "process `input` into into either `output` (`Ok`) or `error` (`Err`)"
     map
+    "revert `output` into valid `input` (this new input should produce the same output when reassigned)"
+    backtrack
     listener::ObserverFunction
 end
 function ObservablePipe(
     input::AbstractObservable{S},
     output::AbstractObservable{T},
     error::AbstractObservable{E};
-    map = Ok
+    map = Ok,
+    backtrack = identity
 ) where {S, T, E}
     listener = on(input; weak = true) do value
         unwrap(ok -> output[] = ok, err -> error[] = err, map(value))
     end
-    ObservablePipe{S, T, E}(input, output, error, map, listener)
+    ObservablePipe{S, T, E}(input, output, error, map, backtrack, listener)
 end
 
 Observables.observe(o::ObservablePipe) = o.output
@@ -40,6 +44,9 @@ Observables.off(o::ObservablePipe) = off(o.input, o.listener)
 
 Base.getindex(o::ObservablePipe) = o.output[]
 Base.setindex!(o::ObservablePipe{S}, value::S) where S = o.input[] = value
+
+backtrack(o::ObservablePipe) = o.output[] |> o.backtrack
+backtrack(o::ObservablePipe, value) = value |> o.backtrack
 # end
 
 # error types
@@ -47,14 +54,22 @@ struct ConversionError <: Exception
     val
     target
 end
+error_message(ex::ConversionError) = string("failed to convert ", ex.val, " to ", ex.target)
 Base.showerror(io::IO, ex::ConversionError) = print(io, "failed to convert ", ex.val, " to ", ex.target)
 
 struct ValidationError <: Exception
     val
     msg
 end
+error_message(ex::ValidationError) = string(ex.val, " failed to validate: ", ex.msg)
 Base.showerror(io::IO, ex::ValidationError) = print(io, ex.val, " failed to validate: ", ex.msg)
+
+error_message(::Nothing) = ""
 # end
+
+DefaultDrawer(::Type) = missing
+DefaultStructDrawer() = missing
+DefaultArrayDrawer() = missing
 
 abstract type AbstractProperty end
 
@@ -69,9 +84,10 @@ end
 function ValueProperty(
     input::AbstractObservable{S},
     output::AbstractObservable{T};
-    drawer::Observable{TDrawer} = Observable(missing),
+    drawer::Observable{TDrawer} = S |> DefaultDrawer |> Observable,
     convert = v -> convert(T, v),
-    validate = Ok
+    validate = Ok,
+    backtrack = v -> convert(S, v)
 ) where {S, T, TDrawer}
     function map(v::S)
         converted =
@@ -83,36 +99,38 @@ function ValueProperty(
         maperr(err -> ValidationError(converted, err), validate(converted))
     end
     error = Observable{Union{Nothing, ConversionError, ValidationError}}(nothing)
-    value = ObservablePipe(input, output, error; map)
+    value = ObservablePipe(input, output, error; map, backtrack)
     ValueProperty{S, T, TDrawer}(value, drawer)
     ValueProperty{S, T, TDrawer}(value, drawer)
 end
 function ValueProperty{T}(
     default::S;
-    drawer::TDrawer = missing,
+    drawer::TDrawer = S |> DefaultDrawer,
     convert = v -> convert(T, v),
-    validate = Ok
+    validate = Ok,
+    backtrack = v -> convert(S, v)
 ) where {S, T, TDrawer}
     input = Observable{S}(default)
     output = Observable{T}(default |> map |> ok)
     drawer = Observable(drawer)
-    ValueProperty(input, output; drawer, convert, validate)
+    ValueProperty(input, output; drawer, convert, validate, backtrack)
 end
 function ValueProperty(
     default::T;
-    drawer::TDrawer = missing,
+    drawer::TDrawer = T |> DefaultDrawer,
     validate = Ok
 ) where {T, TDrawer}
     input = Observable{T}(default)
     output = Observable{T}(default |> validate |> ok)
     drawer = Observable(drawer)
-    ValueProperty(input, output; drawer, convert = identity, validate)
+    ValueProperty(input, output; drawer, convert = identity, validate, backtrack = identity)
 end
 
 observable(p::ValueProperty) = p.value.output
 value(p::ValueProperty) = p.value[]
 drawer(p::ValueProperty) = p.drawer
 lasterror(p::ValueProperty) = p.value.error
+raw(p::ValueProperty) = backtrack(p.value)
 
 Base.getindex(p::ValueProperty) = p.value[]
 Base.setindex!(p::ValueProperty, value) = p.value[] = value
@@ -131,7 +149,7 @@ struct StructProperty{Names, T, TDrawer, TDeref} <: AbstractProperty
 end
 function StructProperty(
     data::NamedTuple{Names, T};
-    drawer::Observable{TDrawer} = Observable(missing),
+    drawer::Observable{TDrawer} = DefaultStructDrawer() |> Observable,
     deref::TDeref = identity
 ) where {Names, T, TDrawer, TDeref}
     event = Observable{ChangedEvent}(ChangedEvent{Missing}())
@@ -167,7 +185,7 @@ struct ArrayProperty{T, N, TDrawer} <: AbstractProperty
 end
 function ArrayProperty(
     data::Array{T, N};
-    drawer::Observable{TDrawer} = Observable(missing)
+    drawer::Observable{TDrawer} = DefaultArrayDrawer() |> Observable
 ) where {T, N, TDrawer}
     event = Observable{ChangedEvent}(ChangedEvent{Missing}())
     listeners = map(enumerate(data)) do (idx, dat)
@@ -202,6 +220,7 @@ struct FieldInfo{T}
     type::Union{Symbol, Expr}
     convert::Option{T}
     validate::Option{T}
+    backtrack::Option{T}
     drawer::Option{T}
 end
 struct FunctionInfo
@@ -259,7 +278,7 @@ macro model(expr)
             $(field.name |> esc) = Observable(getfield(data, $(field.name |> QuoteNode)); ignore_equal_values = true)
             $(Symbol("raw_", field.name) |> esc) = Observable(getfield(data, $(field.name |> QuoteNode)); ignore_equal_values = true)
         else
-            # FIXME: circular dependency: {field} needs drawer_{field}, and drawer_{field} needs {field}
+            # FIXME: circular dependency: {field} needs drawer_{field}, and drawer_{field} needs {field} (only ValueDrawers should be able to register callbacks)
             $(field.name |> esc) = inspect(getfield(data, $(field.name |> QuoteNode)); drawer = $(Symbol("drawer_", field.name)))
         end)
     end
@@ -283,6 +302,16 @@ macro model(expr)
             $(field.name |> esc)
         ) = $body)
     end
+    function esc_backtrack(field)
+        body = unwrap(
+            v -> v.body |> esc,
+            () -> :(convert($(field.type |> esc), $(field.name |> esc))),
+            field.backtrack
+        )
+        :($(Symbol("backtrack_", field.name) |> esc)(
+            $(field.name |> esc)
+        ) = $body)
+    end
     function esc_notify(name)
         :(notify($(Symbol("raw_", name) |> esc)))
     end
@@ -302,13 +331,13 @@ macro model(expr)
         end
     end
     function esc_drawerarg(field)
-        unwrap(identity, () -> :(missing), field.drawer)
+        unwrap(identity, () -> :($(field.type |> esc) |> DefaultDrawer), field.drawer)
     end
     function esc_initdrawer(field)
         quote
             $(Symbol("drawer_", field.name, "_update"))($(esc_drawerdeps(field)...)) = $(esc_drawerarg(field))
             $(Symbol("drawer_", field.name) |> esc) = Observable($(Symbol("drawer_", field.name, "_update"))($(esc_drawerdeps(field; deref = true)...)); ignore_equal_values = true)
-            # TODO: register onany callback if drawerdeps is not empty
+            # TODO: register onany callback if drawerdeps is not empty (only for ValueProperty, other properties are not allowed to have deps on drawer)
         end
     end
     function esc_localfield(field)
@@ -326,6 +355,7 @@ macro model(expr)
                 $(field.name |> esc),
                 convert = $(Symbol("convert_", field.name) |> esc),
                 validate = $(Symbol("validate_", field.name) |> esc),
+                backtrack = $(Symbol("backtrack_", field.name) |> esc),
                 drawer = $(Symbol("drawer_", field.name) |> esc)
             ))
     end
@@ -335,10 +365,11 @@ macro model(expr)
     fields = FieldInfo{Expr}[]
     convert::Option{Expr} = nothing
     validate::Option{Expr} = nothing
+    backtrack::Option{Expr} = nothing
     drawer::Option{Expr} = nothing
     for line in lines
         if @capture(line, name_ :: type_)
-            push!(fields, FieldInfo{Expr}(name, type, convert, validate, drawer))
+            push!(fields, FieldInfo{Expr}(name, type, convert, validate, backtrack, drawer))
             convert = validate = drawer = nothing
         elseif line.head == :macrocall
             name, node, body = line.args
@@ -348,6 +379,8 @@ macro model(expr)
                 convert = Some(body)
             elseif name == Symbol("@validate")
                 validate = Some(body)
+            elseif name == Symbol("@backtrack")
+                backtrack = Some(body)
             elseif name == Symbol("@drawer")
                 drawer = Some(body)
             else
@@ -366,10 +399,13 @@ macro model(expr)
         v = map(field.validate) do v
             FunctionInfo(parse_callback(field.name, v, names)...)
         end
+        b = map(field.backtrack) do b
+            FunctionInfo(parse_callback(field.name, b, names)...)
+        end
         d = map(field.drawer) do d
             FunctionInfo(parse_state(d, names)...)
         end
-        FieldInfo{FunctionInfo}(field.name, field.type, c, v, d)
+        FieldInfo{FunctionInfo}(field.name, field.type, c, v, b, d)
     end
     notifydeps = Dict{Symbol, Set{Symbol}}()
     for name in names
@@ -400,6 +436,7 @@ macro model(expr)
             $(esc_initobs.(fields)...)
             $(esc_defconvert.(fields)...)
             $(esc_defvalidate.(fields)...)
+            $(esc_backtrack.(fields)...)
             listeners = [$(skipmissing(esc_registerdeps.(names, (notifydeps,)))...)]
             $(esc_initdrawer.(fields)...)
             $(esc_initderef(head |> namify, fields))
