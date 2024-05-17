@@ -67,9 +67,10 @@ Base.showerror(io::IO, ex::ValidationError) = print(io, ex.val, " failed to vali
 error_message(::Nothing) = ""
 # end
 
-DefaultDrawer(::Type) = missing
-DefaultStructDrawer() = missing
-DefaultArrayDrawer() = missing
+struct DefaultValueDrawer end
+DefaultDrawer(::Type) = DefaultValueDrawer()
+struct DefaultStructDrawer end
+struct DefaultArrayDrawer end
 
 abstract type AbstractProperty end
 

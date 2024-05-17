@@ -1,15 +1,18 @@
+"convert property name to a human-readable display name"
+function display_name(name::Symbol)
+    name |> String |> s -> replace(s, r"_+" => " ") |> titlecase
+end
+
 """
 Base type for all drawers of `AbstractProperty` sub-types.
 
 # Interface
 - `DrawerType(MyViewModel) = MyDrawer`: link view to view-model
-- `MyDrawer(::MyViewModel)`: setup drawer
 """
 abstract type PropertyDrawer <: Widget end
 
 "Type of view linked to a specific view-model"
 DrawerType(::Type{T}) where T = error("no drawer registered for type $T")
-
 
 """
 Base type for all drawers of `ValueProperty`.
@@ -18,6 +21,19 @@ Base type for all drawers of `ValueProperty`.
 """
 abstract type ValueDrawer <: PropertyDrawer end
 
+"""
+Base type for all drawers of `StructProperty`.
+# Interface
+- `MyStructDrawer(::MyViewModel, ::NamedTuple{Fields, NTuple{N, <:Widget}})`: setup drawer
+"""
+abstract type StructDrawer <: PropertyDrawer end
+
+"""
+Base type for all drawers of `StructProperty`.
+# Interface
+- `MyArrayDrawer(::MyViewModel, ::Array{<:Widget})`: setup drawer
+"""
+abstract type ArrayDrawer <: PropertyDrawer end
 
 struct ObservableToggleButton <: Widget
     toggle::ToggleButton
@@ -109,4 +125,51 @@ Mousetrap.get_top_level_widget(oe::ObservableEntry) = oe.entry
 
 # TODO: define additional widgets
 
-# TODO: setup default view-models/views
+struct EntryDrawer <: ValueDrawer
+    entry::ObservableEntry
+end
+Mousetrap.get_top_level_widget(nfd::EntryDrawer) = nfd.entry
+DrawerType(::DefaultValueDrawer) = EntryDrawer
+function EntryDrawer(::DefaultValueDrawer, data::ObservablePipe{String})
+    entry = ObservableEntry(data)
+    EntryDrawer(entry)
+end
+
+struct SimpleStructDrawer <: StructDrawer
+    root::Box
+    label_box::Box
+    labels::Vector{Label}
+    field_box::Box
+    fields::Vector{<:Widget}
+end
+Mousetrap.get_top_level_widget(ssd::SimpleStructDrawer) = ssd.root
+DrawerType(::DefaultStructDrawer) = SimpleStructDrawer
+function SimpleStructDrawer(::DefaultStructDrawer, fields::NamedTuple{Names, <:Widget}) where Names
+    root = Box(ORIENTATION_HORIZONTAL)
+    label_box = Box(ORIENTATION_VERTICAL)
+    set_horizontal_alignment!(label_box, ALIGNMENT_START)
+    push_front!(root, label_box)
+    labels = [Label(name |> display_name) for name in Names]
+    for label in labels push_back!(label_box, label) end
+    field_box = Box(ORIENTATION_VERTICAL)
+    set_horizontal_alignment!(field_box, ALIGNMENT_END)
+    push_back!(root, field_box)
+    fields = [values(fields)...]
+    for field in fields push_back!(field_box, field) end
+    SimpleStructDrawer(root, label_box, labels, field_box, fields)
+end
+
+struct SimpleArrayDrawer <: ArrayDrawer
+    root::Box
+    elements::Array{<:Widget}
+end
+Mousetrap.get_top_level_widget(sad::SimpleArrayDrawer) = sad.root
+DrawerType(::DefaultArrayDrawer) = SimpleArrayDrawer
+function SimpleArrayDrawer(::DefaultArrayDrawer, elements::Array{<:Widget})
+    root = Box(ORIENTATION_VERTICAL)
+    set_horizontal_alignment!(ALIGNMENT_START)
+    for element in elements push_back!(root, element) end
+    SimpleArrayDrawer(root, elements)
+end
+
+# TODO: setup additional view-models/views
