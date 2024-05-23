@@ -16,6 +16,7 @@ path(e::ChangedEvent) = e.path
 # end ChangedEvent
 
 # ObervablePipe
+export ObservablePipe
 struct ObservablePipe{S, T, E} <: AbstractObservable{T}
     input::Observable{S}
     output::Observable{T}
@@ -67,9 +68,14 @@ Base.showerror(io::IO, ex::ValidationError) = print(io, ex.val, " failed to vali
 error_message(::Nothing) = ""
 # end
 
+export DefaultValueDrawer
 struct DefaultValueDrawer end
 DefaultDrawer(::Type) = DefaultValueDrawer()
+
+export DefaultStructDrawer
 struct DefaultStructDrawer end
+
+export DefaultArrayDrawer
 struct DefaultArrayDrawer end
 
 abstract type AbstractProperty end
@@ -130,6 +136,7 @@ end
 observable(p::ValueProperty) = p.value.output
 value(p::ValueProperty) = p.value[]
 drawer(p::ValueProperty) = p.drawer
+DrawerType(p::ValueProperty{S, T, TDrawer} where {S, T, TDrawer} = DrawerType(TDrawer)
 lasterror(p::ValueProperty) = p.value.error
 raw(p::ValueProperty) = backtrack(p.value)
 
@@ -170,6 +177,7 @@ StructProperty(; data...) = StructProperty((; data...))
 
 observable(p::StructProperty) = p.event
 value(p::StructProperty{Names}) where Names = NamedTuple{Names}(value.(p.data |> values))
+DrawerType(::StructProperty{Names, T, TDrawer}) where {Names, T, TDrawer} = DrawerType(TDrawer)
 
 Base.getindex(p::StructProperty, name::Symbol) = p.data[name]
 Base.getindex(p::StructProperty) = p.deref(p.data)
@@ -204,6 +212,7 @@ end
 
 observable(p::ArrayProperty) = p.event
 value(p::ArrayProperty) = value.(p.data)
+DrawerType(::ArrayProperty{T, N, TDrawer}) where {T, N, TDrawer} = DrawerType(TDrawer)
 
 Base.getindex(p::ArrayProperty, idx...) = p.data[idx...]
 
