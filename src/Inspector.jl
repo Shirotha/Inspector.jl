@@ -5,7 +5,8 @@ using MacroTools
 import MacroTools: postwalk
 
 # Option monad
-Option{T} = Union{Some{T}, Nothing}
+export Option, issomething, unwrap
+Option{T} = Union{Some{T},Nothing}
 
 issomething(x) = !isnothing(x)
 Base.map(f, o::Some) = o |> something |> f |> Some
@@ -15,13 +16,14 @@ unwrap(f, g, ::Nothing) = g()
 # end Option
 
 # Result monad
+export Ok, Err, Result, ok, isok, unwrap, maperr
 struct Ok{T}
     value::T
 end
 struct Err{E}
     error::E
 end
-Result{T, E} = Union{Ok{T}, Err{E}}
+Result{T,E} = Union{Ok{T},Err{E}}
 
 ok(r::Ok) = r.value
 ok(r::Err) = throw(r.error)

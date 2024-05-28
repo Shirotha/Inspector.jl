@@ -13,13 +13,15 @@ Base type for all drawers of `AbstractProperty` sub-types.
 abstract type PropertyDrawer <: Widget end
 
 "Type of view linked to a specific view-model"
-DrawerType(::Type{T}) where T = error("no drawer registered for type $T")
+DrawerType(::Type{T}) where {T} = error("no drawer registered for type $T")
+DrawerType(::Observable{T}) where {T} = DrawerType(T)
 
 export ValueDrawer
 """
 Base type for all drawers of `ValueProperty`.
 # Interface
 - `MyValueDrawer(::Observable{MyViewModel}, ::ObservablePipe)`: setup drawer
+- `SourceType(::Type{MyValueDrawer})`: specify type of data from GUI side
 """
 abstract type ValueDrawer <: PropertyDrawer end
 
@@ -49,6 +51,7 @@ function ObservableToggleButton(data::ObservablePipe{Bool})
     set_is_active!(toggle, data |> backtrack)
     connect_signal_toggled!(toggle) do self
         data[] = get_is_active(self)
+        nothing
     end
     listener = on(data) do value
         set_signal_toggled_blocked!(toggle, true)
@@ -66,10 +69,10 @@ struct ObservableAdjustment
     listeners::Vector{ObserverFunction}
 end
 function ObservableAdjustment(
-    value::Union{Number, ObservablePipe{<:Number}},
-    lower::Union{Number, ObservablePipe{<:Number}},
-    upper::Union{Number, ObservablePipe{<:Number}},
-    increment::Union{Number, ObservablePipe{<:Number}}
+    value::Union{Number,ObservablePipe{<:Number}},
+    lower::Union{Number,ObservablePipe{<:Number}},
+    upper::Union{Number,ObservablePipe{<:Number}},
+    increment::Union{Number,ObservablePipe{<:Number}}
 )
     deref(x) = x isa ObservablePipe ? backtrack(x) : x
 
@@ -78,6 +81,7 @@ function ObservableAdjustment(
     if value isa ObservablePipe
         connect_signal_value_changed!(adjustment) do self
             value[] = get_value(self)
+            nothing
         end
         push!(listeners, on(value) do val
             set_signal_value_changed_blocked!(adjustment, true)
@@ -112,10 +116,14 @@ struct ObservableEntry <: Widget
 end
 function ObservableEntry(data::ObservablePipe{String})
     entry = Entry()
-    connect_signal_text_changed!(entry) do self
-        data[] = get_text(self)
+    set_text!(entry, data |> backtrack)
+    connect_signal_text_changed!(entry) do _
+        @debug "try update value $(data[]) -> $(get_text(entry))"
+        data[] = get_text(entry)
+        nothing
     end
     listener = on(data) do value
+        @debug "value was changed to $(value)"
         # TODO: restore color
         set_tooltip_text!(entry, "")
         set_signal_text_changed_blocked!(entry, true)
@@ -123,6 +131,7 @@ function ObservableEntry(data::ObservablePipe{String})
         set_signal_text_changed_blocked!(entry, false)
     end
     error = on(data.error) do error
+        @debug error_message(error)
         # TODO: color red
         set_tooltip_text!(entry, error |> error_message)
     end
@@ -138,6 +147,7 @@ struct EntryDrawer <: ValueDrawer
 end
 Mousetrap.get_top_level_widget(nfd::EntryDrawer) = nfd.entry
 DrawerType(::Type{DefaultValueDrawer}) = EntryDrawer
+SourceType(::Type{EntryDrawer}) = String
 function EntryDrawer(::Observable{DefaultValueDrawer}, data::ObservablePipe{String})
     entry = ObservableEntry(data)
     EntryDrawer(entry)
@@ -145,27 +155,21 @@ end
 
 export SimpleStructDrawer
 struct SimpleStructDrawer <: StructDrawer
-    root::Box
-    label_box::Box
+    root::Grid
     labels::Vector{Label}
-    field_box::Box
     fields::Vector{<:Widget}
 end
 Mousetrap.get_top_level_widget(ssd::SimpleStructDrawer) = ssd.root
 DrawerType(::Type{DefaultStructDrawer}) = SimpleStructDrawer
-function SimpleStructDrawer(::Observable{DefaultStructDrawer}, fields::NamedTuple{Names, <:Widget}) where Names
-    root = Box(ORIENTATION_HORIZONTAL)
-    label_box = Box(ORIENTATION_VERTICAL)
-    set_horizontal_alignment!(label_box, ALIGNMENT_START)
-    push_front!(root, label_box)
+function SimpleStructDrawer(::Observable{DefaultStructDrawer}, fields::NamedTuple{Names}) where {Names}
+    root = Grid()
     labels = [Label(name |> display_name) for name in Names]
-    for label in labels push_back!(label_box, label) end
-    field_box = Box(ORIENTATION_VERTICAL)
-    set_horizontal_alignment!(field_box, ALIGNMENT_END)
-    push_back!(root, field_box)
     fields = [values(fields)...]
-    for field in fields push_back!(field_box, field) end
-    SimpleStructDrawer(root, label_box, labels, field_box, fields)
+    for (row, (label, field)) in zip(labels, fields) |> enumerate
+        Mousetrap.insert_at!(root, label, 1, row)
+        Mousetrap.insert_at!(root, field, 2, row)
+    end
+    SimpleStructDrawer(root, labels, fields)
 end
 
 export SimpleArrayDrawer
@@ -178,7 +182,9 @@ DrawerType(::Type{DefaultArrayDrawer}) = SimpleArrayDrawer
 function SimpleArrayDrawer(::Observable{DefaultArrayDrawer}, elements::Array{<:Widget})
     root = Box(ORIENTATION_VERTICAL)
     set_horizontal_alignment!(root, ALIGNMENT_START)
-    for element in elements push_back!(root, element) end
+    for element in elements
+        push_back!(root, element)
+    end
     SimpleArrayDrawer(root, elements)
 end
 
@@ -188,7 +194,7 @@ function PropertyDrawer(model::ValueProperty)
     Drawer = DrawerType(model)
     Drawer(model.drawer, model.value)
 end
-function PropertyDrawer(model::StructProperty{Names}) where Names
+function PropertyDrawer(model::StructProperty{Names}) where {Names}
     children = NamedTuple{Names}(PropertyDrawer.(values(model.data)))
     Drawer = DrawerType(model)
     Drawer(model.drawer, children)
